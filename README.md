@@ -1,6 +1,6 @@
 # ◈ GitYard
 
-A modern, Apple-inspired terminal user interface (TUI) for managing multiple Git repositories and monorepos in a single workspace. Track branch synchronization, detect dependency drifts, run NPM scripts, and upgrade packages directly from your terminal.
+A modern terminal user interface (TUI) for managing multiple Git repositories and monorepos in a single workspace. Track branch synchronization, detect dependency drifts, run NPM scripts, and upgrade packages directly from your terminal.
 
 ## Features
 
