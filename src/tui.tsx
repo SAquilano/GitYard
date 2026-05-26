@@ -12,9 +12,17 @@ import {
 } from './dependencies.js';
 import { taskRunner } from './runner.js';
 
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
 function truncate(str: string, len: number): string {
   if (!str) return '';
   return str.length > len ? str.substring(0, len - 3) + '...' : str;
+}
+
+function getProgressBar(current: number, total: number): string {
+  const width = 12;
+  const progress = total > 0 ? Math.round((current / total) * width) : 0;
+  return '█'.repeat(progress) + '░'.repeat(width - progress);
 }
 
 interface TUIProps {
@@ -31,17 +39,19 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
   const [pkgDrifts, setPkgDrifts] = useState<Map<string, DependencyDrift>>(new Map());
   const [pkgStatuses, setPkgStatuses] = useState<Record<string, PackageStatus[]>>({});
   
-  // Navigation & UI States
   const [selectedRepoIdx, setSelectedRepoIdx] = useState<number>(0);
   const [selectedScriptIdx, setSelectedScriptIdx] = useState<number>(0);
   const [activePane, setActivePane] = useState<'repos' | 'details'>('repos');
   const [isLogsExpanded, setIsLogsExpanded] = useState<boolean>(false);
   
-  // Action Feedback
   const [pullStatus, setPullStatus] = useState<{ repoPath: string; success: boolean; message: string } | null>(null);
   const [isPulling, setIsPulling] = useState<boolean>(false);
+  const [pullAllProgress, setPullAllProgress] = useState<{ current: number; total: number; repoName: string } | null>(null);
+  const [pullAllResults, setPullAllResults] = useState<{ success: number; failed: number; total: number } | null>(null);
   const [scanning, setScanning] = useState<boolean>(true);
-  const [logTrigger, setLogTrigger] = useState<number>(0); // Ticked by task runner logs
+  const [logTrigger, setLogTrigger] = useState<number>(0);
+
+  const [animationTick, setAnimationTick] = useState(0);
 
   const selectedRepo = repos[selectedRepoIdx];
   const selectedRepoPkg = selectedRepo
@@ -50,17 +60,84 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
   const availableScripts = selectedRepoPkg ? Object.keys(selectedRepoPkg.scripts) : [];
   const selectedScript = availableScripts[selectedScriptIdx];
 
-  // 1. Listen to Task Runner logs
-  useEffect(() => {
-    const unsubscribe = taskRunner.addListener(() => {
+  const spinner = SPINNER_FRAMES[animationTick % SPINNER_FRAMES.length];
+
+  const updateTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const triggerUpdate = () => {
+    if (updateTimerRef.current) {
+      clearTimeout(updateTimerRef.current);
+    }
+    updateTimerRef.current = setTimeout(() => {
       setLogTrigger(prev => prev + 1);
-    });
+    }, 150);
+  };
+
+  useEffect(() => {
     return () => {
-      unsubscribe();
+      if (updateTimerRef.current) {
+        clearTimeout(updateTimerRef.current);
+      }
     };
   }, []);
 
-  // 2. Scan Workspace & Poll statuses
+  const hasRunningTasks = pkgConfigs.some(pkg =>
+    Object.keys(pkg.scripts).some(script =>
+      taskRunner.getTaskStatus(pkg.repoPath, script) === 'running'
+    )
+  );
+
+  const shouldAnimate = scanning || isPulling || !!pullAllProgress || hasRunningTasks;
+
+  useEffect(() => {
+    if (!shouldAnimate) return;
+    const timer = setInterval(() => {
+      setAnimationTick(t => t + 1);
+    }, 250);
+    return () => clearInterval(timer);
+  }, [shouldAnimate]);
+
+  const lastTaskStatuses = useRef<Record<string, string>>({});
+  const logUpdateTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    const unsubscribe = taskRunner.addListener(() => {
+      let statusChanged = false;
+      const newStatuses: Record<string, string> = {};
+      for (const repo of repos) {
+        const repoPkgInfo = pkgConfigs.find(p => p.repoPath === repo.path);
+        const scriptsList = repoPkgInfo ? Object.keys(repoPkgInfo.scripts) : [];
+        for (const script of scriptsList) {
+          const status = taskRunner.getTaskStatus(repo.path, script);
+          newStatuses[`${repo.path}::${script}`] = status;
+          if (lastTaskStatuses.current[`${repo.path}::${script}`] !== status) {
+            statusChanged = true;
+          }
+        }
+      }
+      lastTaskStatuses.current = newStatuses;
+
+      if (statusChanged) {
+        setLogTrigger(prev => prev + 1);
+        return;
+      }
+
+      if (isLogsExpanded) {
+        if (logUpdateTimerRef.current) return;
+        logUpdateTimerRef.current = setTimeout(() => {
+          logUpdateTimerRef.current = null;
+          setLogTrigger(prev => prev + 1);
+        }, 200);
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      if (logUpdateTimerRef.current) {
+        clearTimeout(logUpdateTimerRef.current);
+      }
+    };
+  }, [repos, pkgConfigs, isLogsExpanded]);
+
   const doScanAndRefresh = async () => {
     setScanning(true);
     const scanned = await scanWorkspace(initialWorkspacePath);
@@ -69,14 +146,12 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
 
     if (scanned.length === 0) return;
 
-    // Load package configs & calculate drift
     const configs = await loadWorkspacePackages(scanned);
     setPkgConfigs(configs);
 
     const drifts = calculateDrifts(configs);
     setPkgDrifts(drifts);
 
-    // Initial git & dependency status fetch
     const newGitStatuses: Record<string, RepoGitStatus> = {};
     const newPkgStatuses: Record<string, PackageStatus[]> = {};
 
@@ -89,10 +164,7 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
           repo.name,
           configs,
           drifts,
-          () => {
-            // Trigger refresh on registry version resolves
-            setLogTrigger(prev => prev + 1);
-          }
+          triggerUpdate
         );
         newPkgStatuses[repo.path] = depStatuses;
       })
@@ -104,7 +176,6 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
 
   useEffect(() => {
     doScanAndRefresh();
-    // Poll Git Status every 7 seconds
     const interval = setInterval(async () => {
       if (repos.length === 0) return;
       const newGitStatuses: Record<string, RepoGitStatus> = {};
@@ -118,52 +189,43 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
     return () => clearInterval(interval);
   }, [initialWorkspacePath]);
 
-  // Keep script index bounded when repository changes
   useEffect(() => {
     setSelectedScriptIdx(0);
   }, [selectedRepoIdx]);
 
-  // 3. User Input Handler (Keybinds)
   useInput((input, key) => {
-    // Quit
     if (input === 'q' || (key.ctrl && input === 'c')) {
       taskRunner.killAll();
       exit();
       return;
     }
 
-    // Switch Pane
     if (key.tab) {
       setActivePane(prev => (prev === 'repos' ? 'details' : 'repos'));
       return;
     }
 
-    // Toggle logs panel
     if (input === 'l' || input === 'L') {
       setIsLogsExpanded(prev => !prev);
       return;
     }
 
-    // Manual Refresh
     if (input === 'r' || input === 'R') {
       doScanAndRefresh();
       return;
     }
 
-    // Git Pull Selected Repo
-    if ((input === 'p' || input === 'P') && selectedRepo && !isPulling) {
+    if ((input === 'p' || input === 'P') && selectedRepo && !isPulling && !pullAllProgress) {
       setIsPulling(true);
       setPullStatus(null);
       pullRepository(selectedRepo.path).then((res) => {
         setIsPulling(false);
         setPullStatus({ repoPath: selectedRepo.path, ...res });
         
-        // Refresh statuses for the pulled repo
         getGitStatus(selectedRepo.path).then((gitInfo) => {
           setGitStatuses(prev => ({ ...prev, [selectedRepo.path]: gitInfo }));
         });
 
-        // Clear notification after 4s
         setTimeout(() => {
           setPullStatus(null);
         }, 4000);
@@ -171,7 +233,38 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
       return;
     }
 
-    // Navigation (Up / Down)
+    if ((input === 'a' || input === 'A') && repos.length > 0 && !isPulling && !pullAllProgress) {
+      setPullAllResults(null);
+      const total = repos.length;
+      let success = 0;
+      let failed = 0;
+
+      (async () => {
+        for (let i = 0; i < repos.length; i++) {
+          const repo = repos[i];
+          setPullAllProgress({ current: i + 1, total, repoName: repo.name });
+
+          const res = await pullRepository(repo.path);
+          if (res.success) {
+            success++;
+          } else {
+            failed++;
+          }
+
+          const gitInfo = await getGitStatus(repo.path);
+          setGitStatuses(prev => ({ ...prev, [repo.path]: gitInfo }));
+        }
+
+        setPullAllProgress(null);
+        setPullAllResults({ success, failed, total });
+
+        setTimeout(() => {
+          setPullAllResults(null);
+        }, 6000);
+      })();
+      return;
+    }
+
     if (key.upArrow) {
       if (activePane === 'repos') {
         setSelectedRepoIdx(prev => (prev > 0 ? prev - 1 : repos.length - 1));
@@ -190,7 +283,6 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
       return;
     }
 
-    // Toggle NPM script execution
     if (key.return || input === ' ') {
       if (activePane === 'details' && selectedRepo && selectedScript) {
         const currentStatus = taskRunner.getTaskStatus(selectedRepo.path, selectedScript);
@@ -207,8 +299,13 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
   if (scanning && repos.length === 0) {
     return (
       <Box flexDirection="column" padding={2}>
-        <Text color="cyan" bold>⚡ Gityard Workspace Manager</Text>
-        <Text dimColor>Scanning workspace directories...</Text>
+        <Box flexDirection="row" alignItems="center">
+          <Text color="cyan">{spinner} </Text>
+          <Text bold color="cyan">GitYard Workspace Manager</Text>
+        </Box>
+        <Box marginTop={1}>
+          <Text dimColor>Scanning workspace directories...</Text>
+        </Box>
       </Box>
     );
   }
@@ -219,28 +316,29 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
         <Text color="red" bold>🔴 No Git Repositories Found</Text>
         <Text>Gityard scans immediate subdirectories of the current path for `.git` folders.</Text>
         <Text dimColor>Path: {initialWorkspacePath}</Text>
-        <Box marginY={1}>
+        <Box marginTop={1}>
           <Text color="yellow">Press [Q] to exit.</Text>
         </Box>
       </Box>
     );
   }
 
-  // Check if any task is running in a given repo
   const isAnyTaskRunningInRepo = (repoPath: string, scriptsList: string[]): boolean => {
     return scriptsList.some(s => taskRunner.getTaskStatus(repoPath, s) === 'running');
   };
 
   return (
     <Box flexDirection="column" width="100%" padding={1}>
-      {/* App Header */}
-      <Box justifyContent="space-between" marginBottom={1}>
-        <Text color="cyan" bold>⚡ Gityard Workspace Manager</Text><Text dimColor>{repos.length} Repositories found | {initialWorkspacePath}</Text>
+      <Box justifyContent="space-between" marginBottom={1} borderStyle="single" borderBottom borderTop={false} borderLeft={false} borderRight={false} borderColor="gray" paddingBottom={1}>
+        <Box flexDirection="row" alignItems="center">
+          <Text color="cyan" bold>◈ GitYard</Text>
+          <Text dimColor> ─ Workspace Manager</Text>
+          {scanning && <Text color="yellow">  {spinner} scanning...</Text>}
+        </Box>
+        <Text dimColor>{repos.length} repos │ {initialWorkspacePath}</Text>
       </Box>
 
-      {/* Main Workspace: Left Grid & Right Panel */}
-      <Box flexDirection="row" height={Math.max(6, isLogsExpanded ? terminalRows - 16 : terminalRows - 8)}>
-        {/* Left Pane - Repositories */}
+      <Box flexDirection="row" height={Math.max(6, isLogsExpanded ? terminalRows - 21 : terminalRows - 14)}>
         <Box
           flexDirection="column"
           width="50%"
@@ -250,7 +348,7 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
         >
           <Box marginBottom={1}>
             <Text bold color={activePane === 'repos' ? 'cyan' : 'white'}>
-              📂 WORKSPACE REPOSITORIES
+              📂 REPOSITORIES
             </Text>
           </Box>
 
@@ -261,24 +359,27 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
             const scriptsList = repoPkgInfo ? Object.keys(repoPkgInfo.scripts) : [];
             const hasTaskActive = isAnyTaskRunningInRepo(repo.path, scriptsList);
 
-            // Icon statuses
-            let statusIcon = '🟢';
+            let statusIcon = '●';
             let statusLabel = 'Clean';
+            let statusColor = 'green';
             
             if (status) {
               if (status.conflictedCount > 0) {
-                statusIcon = '🔴';
+                statusIcon = '●';
                 statusLabel = 'Conflict';
+                statusColor = 'red';
               } else if (status.uncommittedCount > 0 || status.untrackedCount > 0) {
-                statusIcon = '🟡';
+                statusIcon = '●';
                 statusLabel = `⚡ +${status.uncommittedCount}/${status.untrackedCount}`;
+                statusColor = 'yellow';
               } else if (status.behind > 0) {
-                statusIcon = '🟡';
+                statusIcon = '●';
                 statusLabel = `Pending Pull`;
+                statusColor = 'yellow';
               }
             }
 
-            const prefix = isSelected ? '> ' : '  ';
+            const prefix = isSelected ? '❯ ' : '  ';
             const displayColor = isSelected
               ? activePane === 'repos'
                 ? 'cyan'
@@ -291,7 +392,7 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
                   <Text>
                     <Text color={displayColor} bold={isSelected}>
                       {prefix}
-                      {statusIcon} {repo.name}
+                      <Text color={statusColor}>{statusIcon}</Text> {repo.name}
                     </Text>
                     {status && (
                       <Text dimColor={!isSelected} color="gray">
@@ -302,8 +403,8 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
                 </Box>
                 <Box>
                   <Text>
-                    {hasTaskActive && <Text color="green">🚀 </Text>}
-                    <Text color={statusIcon === '🟢' ? 'green' : 'yellow'} dimColor={!isSelected}>
+                    {hasTaskActive && <Text color="green">{spinner} </Text>}
+                    <Text color={statusColor} dimColor={!isSelected}>
                       {statusLabel}
                     </Text>
                   </Text>
@@ -313,7 +414,6 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
           })}
         </Box>
 
-        {/* Right Pane - Repository Details & Script Selection */}
         <Box
           flexDirection="column"
           width="50%"
@@ -323,63 +423,73 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
         >
           {selectedRepo ? (
             <Box flexDirection="column" height="100%">
-              {/* Repo Details Header */}
               <Box borderStyle="single" borderBottom borderTop={false} borderLeft={false} borderRight={false} borderColor="gray" paddingBottom={1} marginBottom={1} flexDirection="column">
-                <Text bold color="yellow">📦 {selectedRepo.name.toUpperCase()}</Text>{gitStatuses[selectedRepo.path] && (
-                  <Box flexDirection="column" marginTop={1}>
-                    <Text dimColor>Branch: {gitStatuses[selectedRepo.path].branch}</Text>
-                    <Text dimColor>
-                      Sync Status: Ahead {gitStatuses[selectedRepo.path].ahead} | Behind {gitStatuses[selectedRepo.path].behind}
-                    </Text>
+                <Text bold color="yellow">📦 {selectedRepo.name.toUpperCase()}</Text>
+                {gitStatuses[selectedRepo.path] && (
+                  <Box flexDirection="row" marginTop={1}>
+                    <Text dimColor>Branch: </Text>
+                    <Text color="white">{gitStatuses[selectedRepo.path].branch}</Text>
+                    <Text dimColor>  │  Sync: </Text>
+                    <Text color={gitStatuses[selectedRepo.path].ahead > 0 ? 'green' : 'white'}>↑{gitStatuses[selectedRepo.path].ahead}</Text>
+                    <Text dimColor> / </Text>
+                    <Text color={gitStatuses[selectedRepo.path].behind > 0 ? 'yellow' : 'white'}>↓{gitStatuses[selectedRepo.path].behind}</Text>
                   </Box>
                 )}
               </Box>
 
-              {/* NPM Script Selection */}
               {availableScripts.length > 0 ? (
                 <Box flexDirection="column" marginBottom={1}>
                   <Text bold color={activePane === 'details' ? 'cyan' : 'white'}>
-                    🏃♂️ NPM Scripts (Use Return/Space to Toggle):
-                  </Text>{availableScripts.map((scriptName, idx) => {
+                    🏃 NPM Scripts:
+                  </Text>
+                  {availableScripts.map((scriptName, idx) => {
                     const isSelected = idx === selectedScriptIdx;
                     const isScriptFocused = isSelected && activePane === 'details';
                     const runStatus = taskRunner.getTaskStatus(selectedRepo.path, scriptName);
                     
-                    let statusText = '[Stopped]';
+                    let statusIcon = '○';
+                    let statusText = 'idle';
                     let statusColor = 'gray';
+                    
                     if (runStatus === 'running') {
-                      statusText = '[🚀 Running]';
+                      statusIcon = spinner;
+                      statusText = 'running';
                       statusColor = 'green';
                     } else if (runStatus === 'failed') {
-                      statusText = '[🔴 Failed]';
+                      statusIcon = '✖';
+                      statusText = 'failed';
                       statusColor = 'red';
                     } else if (runStatus === 'success') {
-                      statusText = '[🟢 Completed]';
+                      statusIcon = '✓';
+                      statusText = 'done';
                       statusColor = 'green';
                     }
 
                     return (
                       <Box key={scriptName} justifyContent="space-between">
                         <Text color={isScriptFocused ? 'cyan' : isSelected ? 'white' : 'gray'} bold={isSelected}>
-                          {isSelected ? ' > ' : '   '}
-                          {scriptName}: <Text dimColor>{truncate(selectedRepoPkg?.scripts[scriptName] || '', 24)}</Text>
-                        </Text><Text color={statusColor}>{statusText}</Text>
+                          {isSelected ? '❯ ' : '  '}
+                          {scriptName} <Text dimColor>─ {truncate(selectedRepoPkg?.scripts[scriptName] || '', 20)}</Text>
+                        </Text>
+                        <Text color={statusColor} bold={runStatus === 'running'}>
+                          {statusIcon} {statusText}
+                        </Text>
                       </Box>
                     );
                   })}
                 </Box>
               ) : (
                 <Box marginBottom={1}>
-                  <Text dimColor>No NPM scripts found (no package.json or scripts block).</Text>
+                  <Text dimColor>No NPM scripts found.</Text>
                 </Box>
               )}
 
-              {/* Package dependencies / Drift */}
-              <Box flexDirection="column">
-                <Text bold>📦 Dependency Status / Drift:</Text>{pkgStatuses[selectedRepo.path] && pkgStatuses[selectedRepo.path].length > 0 ? (
+              <Box flexDirection="column" marginTop={1}>
+                <Text bold>📦 Dependency Status:</Text>
+                {pkgStatuses[selectedRepo.path] && pkgStatuses[selectedRepo.path].length > 0 ? (
                   pkgStatuses[selectedRepo.path]
                     .filter(status => status.hasDrift || status.isOutdated)
-                    .slice(0, 3) // show up to 3 warnings to fit screen
+                    .slice(0, 3)
                     .map((status) => {
                       let driftDetail = '';
                       if (status.hasDrift && status.driftVersions) {
@@ -392,14 +502,14 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
 
                       return (
                         <Text key={status.packageName} color="yellow" dimColor>
-                          ⚠️ {status.packageName}: {status.currentVersion}
-                          {status.isOutdated && ` -> ${status.latestVersion}`}
+                          ▲ {status.packageName}: {status.currentVersion}
+                          {status.isOutdated && ` → ${status.latestVersion}`}
                           {driftDetail}
                         </Text>
                       );
                     })
                 ) : (
-                  <Text dimColor>All packages up-to-date & synchronized</Text>
+                  <Text color="green">✓ All packages up-to-date & synchronized</Text>
                 )}
                 {pkgStatuses[selectedRepo.path] && 
                  pkgStatuses[selectedRepo.path].filter(status => status.hasDrift || status.isOutdated).length > 3 && (
@@ -415,44 +525,59 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
         </Box>
       </Box>
 
-      {/* Action status notification */}
-      {isPulling && (
-        <Box marginY={1}>
-          <Text color="cyan">🔄 Pulling updates from remote for {selectedRepo?.name}...</Text>
-        </Box>
-      )}
-      {!isPulling && pullStatus && pullStatus.repoPath === selectedRepo?.path && (
-        <Box marginY={1}>
+      <Box height={2} marginTop={1} flexDirection="column">
+        {isPulling && (
+          <Text color="cyan">{spinner} Pulling updates for {selectedRepo?.name}...</Text>
+        )}
+        {!isPulling && pullStatus && pullStatus.repoPath === selectedRepo?.path && (
           <Text color={pullStatus.success ? 'green' : 'red'}>
-            {pullStatus.success ? '🟢' : '🔴'} {pullStatus.message}
+            {pullStatus.success ? '✓' : '✖'} {pullStatus.message}
           </Text>
-        </Box>
-      )}
+        )}
+        {pullAllProgress && (
+          <Box flexDirection="column">
+            <Box flexDirection="row">
+              <Text color="cyan">{spinner} Pull All: </Text>
+              <Text bold color="white">{pullAllProgress.current}/{pullAllProgress.total}</Text>
+              <Text dimColor> ─ Pulling {pullAllProgress.repoName}...</Text>
+            </Box>
+            <Box>
+              <Text color="cyan">{getProgressBar(pullAllProgress.current, pullAllProgress.total)}</Text>
+            </Box>
+          </Box>
+        )}
+        {!pullAllProgress && pullAllResults && (
+          <Text color={pullAllResults.failed === 0 ? 'green' : 'yellow'} bold>
+            {pullAllResults.failed === 0 ? '✓' : '▲'} Pull All complete: {pullAllResults.success}/{pullAllResults.total} succeeded{pullAllResults.failed > 0 ? `, ${pullAllResults.failed} failed` : ''}
+          </Text>
+        )}
+      </Box>
 
-      {/* Bottom Panel - Active Log Viewer */}
       {isLogsExpanded && (
         <Box
           flexDirection="column"
           borderStyle="round"
           borderColor="gray"
           paddingX={1}
-          height={5}
+          height={6}
+          marginTop={1}
         >
           <Box justifyContent="space-between">
             <Text bold color="yellow">
-              📋 LOGS: {selectedRepo?.name} {selectedScript ? `> ${selectedScript}` : ''}
-            </Text><Text dimColor>[Press L to Collapse]</Text>
+              📋 Logs: {selectedRepo?.name} {selectedScript ? `› ${selectedScript}` : ''}
+            </Text>
+            <Text dimColor>[L to Collapse]</Text>
           </Box>
           
           {selectedRepo && selectedScript ? (
-            <Box flexDirection="column" marginTop={0}>
+            <Box flexDirection="column" marginTop={1}>
               {taskRunner.getLogs(selectedRepo.path, selectedScript).slice(-2).map((logLine, index) => (
                 <Text key={index} wrap="truncate" dimColor>
                   {logLine}
                 </Text>
               ))}
               {taskRunner.getLogs(selectedRepo.path, selectedScript).length === 0 && (
-                <Text dimColor>No logs. Highlight a script in details and hit Space to run it.</Text>
+                <Text dimColor>No logs. Press Space on a script to start execution.</Text>
               )}
             </Box>
           ) : (
@@ -461,17 +586,16 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
         </Box>
       )}
 
-      {/* Bottom Status / Help Bar */}
       <Box borderStyle="single" borderTop borderBottom={false} borderLeft={false} borderRight={false} borderColor="gray" marginTop={1} paddingY={0}>
         <Text>
-          <Text dimColor>Hotkeys: </Text>
-          <Text color="cyan">[Tab]</Text><Text dimColor> Switch Pane | </Text>
-          <Text color="cyan">[Arrows]</Text><Text dimColor> Navigate | </Text>
-          <Text color="cyan">[Space/Enter]</Text><Text dimColor> Run Script | </Text>
-          <Text color="cyan">[P]</Text><Text dimColor> Git Pull | </Text>
-          <Text color="cyan">[R]</Text><Text dimColor> Refresh | </Text>
-          <Text color="cyan">[L]</Text><Text dimColor> Toggle Logs | </Text>
-          <Text color="cyan">[Q]</Text><Text dimColor> Quit</Text>
+          <Text color="cyan" bold>Tab</Text><Text dimColor> Switch  </Text>
+          <Text color="cyan" bold>▲▼</Text><Text dimColor> Navigate  </Text>
+          <Text color="cyan" bold>Space</Text><Text dimColor> Run  </Text>
+          <Text color="cyan" bold>P</Text><Text dimColor> Pull  </Text>
+          <Text color="cyan" bold>A</Text><Text dimColor> Pull All  </Text>
+          <Text color="cyan" bold>R</Text><Text dimColor> Refresh  </Text>
+          <Text color="cyan" bold>L</Text><Text dimColor> Logs  </Text>
+          <Text color="cyan" bold>Q</Text><Text dimColor> Quit</Text>
         </Text>
       </Box>
     </Box>
