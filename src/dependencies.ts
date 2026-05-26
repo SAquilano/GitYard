@@ -1,5 +1,9 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execAsync = promisify(exec);
 
 export interface PackageDependencies {
   repoName: string;
@@ -177,4 +181,23 @@ export async function getRepoDependencyStatuses(
   });
 
   return statuses;
+}
+
+export async function installDependency(
+  repoPath: string,
+  packageName: string,
+  version: string
+): Promise<{ success: boolean; message: string }> {
+  try {
+    await execAsync(`npm install ${packageName}@${version}`, { cwd: repoPath });
+    return {
+      success: true,
+      message: `Updated ${packageName} to ${version}`,
+    };
+  } catch (error: any) {
+    return {
+      success: false,
+      message: `Failed to update ${packageName}: ${error.message || error}`,
+    };
+  }
 }

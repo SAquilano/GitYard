@@ -6,6 +6,7 @@ import {
   loadWorkspacePackages,
   calculateDrifts,
   getRepoDependencyStatuses,
+  installDependency,
   PackageDependencies,
   DependencyDrift,
   PackageStatus,
@@ -41,9 +42,12 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
   
   const [selectedRepoIdx, setSelectedRepoIdx] = useState<number>(0);
   const [selectedScriptIdx, setSelectedScriptIdx] = useState<number>(0);
-  const [activePane, setActivePane] = useState<'repos' | 'details'>('repos');
+  const [selectedDepIdx, setSelectedDepIdx] = useState<number>(0);
+  const [activePane, setActivePane] = useState<'repos' | 'details' | 'dependencies'>('repos');
   const [isLogsExpanded, setIsLogsExpanded] = useState<boolean>(false);
-  
+  const [isUpdatingDep, setIsUpdatingDep] = useState<boolean>(false);
+  const [updateDepStatus, setUpdateDepStatus] = useState<{ packageName: string; success: boolean; message: string } | null>(null);
+
   const [pullStatus, setPullStatus] = useState<{ repoPath: string; success: boolean; message: string } | null>(null);
   const [isPulling, setIsPulling] = useState<boolean>(false);
   const [pullAllProgress, setPullAllProgress] = useState<{ current: number; total: number; repoName: string } | null>(null);
@@ -59,6 +63,9 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
     : null;
   const availableScripts = selectedRepoPkg ? Object.keys(selectedRepoPkg.scripts) : [];
   const selectedScript = availableScripts[selectedScriptIdx];
+  const shownDeps = pkgStatuses[selectedRepo?.path]
+    ? pkgStatuses[selectedRepo.path].filter(status => status.hasDrift || status.isOutdated)
+    : [];
 
   const spinner = SPINNER_FRAMES[animationTick % SPINNER_FRAMES.length];
 
@@ -86,7 +93,7 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
     )
   );
 
-  const shouldAnimate = scanning || isPulling || !!pullAllProgress || hasRunningTasks;
+  const shouldAnimate = scanning || isPulling || !!pullAllProgress || hasRunningTasks || isUpdatingDep;
 
   useEffect(() => {
     if (!shouldAnimate) return;
@@ -174,6 +181,18 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
     setPkgStatuses(newPkgStatuses);
   };
 
+  const performDependencyUpdate = async (repoPath: string, packageName: string, version: string) => {
+    setIsUpdatingDep(true);
+    setUpdateDepStatus(null);
+    const res = await installDependency(repoPath, packageName, version);
+    setIsUpdatingDep(false);
+    setUpdateDepStatus({ packageName, ...res });
+    await doScanAndRefresh();
+    setTimeout(() => {
+      setUpdateDepStatus(null);
+    }, 5000);
+  };
+
   useEffect(() => {
     doScanAndRefresh();
     const interval = setInterval(async () => {
@@ -191,6 +210,7 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
 
   useEffect(() => {
     setSelectedScriptIdx(0);
+    setSelectedDepIdx(0);
   }, [selectedRepoIdx]);
 
   useInput((input, key) => {
@@ -201,7 +221,18 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
     }
 
     if (key.tab) {
-      setActivePane(prev => (prev === 'repos' ? 'details' : 'repos'));
+      setActivePane(prev => {
+        if (prev === 'repos') {
+          if (availableScripts.length > 0) return 'details';
+          if (shownDeps.length > 0) return 'dependencies';
+          return 'repos';
+        }
+        if (prev === 'details') {
+          if (shownDeps.length > 0) return 'dependencies';
+          return 'repos';
+        }
+        return 'repos';
+      });
       return;
     }
 
@@ -268,8 +299,10 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
     if (key.upArrow) {
       if (activePane === 'repos') {
         setSelectedRepoIdx(prev => (prev > 0 ? prev - 1 : repos.length - 1));
-      } else {
+      } else if (activePane === 'details') {
         setSelectedScriptIdx(prev => (prev > 0 ? prev - 1 : availableScripts.length - 1));
+      } else if (activePane === 'dependencies') {
+        setSelectedDepIdx(prev => (prev > 0 ? prev - 1 : shownDeps.length - 1));
       }
       return;
     }
@@ -277,8 +310,10 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
     if (key.downArrow) {
       if (activePane === 'repos') {
         setSelectedRepoIdx(prev => (prev < repos.length - 1 ? prev + 1 : 0));
-      } else {
+      } else if (activePane === 'details') {
         setSelectedScriptIdx(prev => (prev < availableScripts.length - 1 ? prev + 1 : 0));
+      } else if (activePane === 'dependencies') {
+        setSelectedDepIdx(prev => (prev < shownDeps.length - 1 ? prev + 1 : 0));
       }
       return;
     }
@@ -290,6 +325,11 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
           taskRunner.stopTask(selectedRepo.path, selectedScript);
         } else {
           taskRunner.startTask(selectedRepo.name, selectedRepo.path, selectedScript);
+        }
+      } else if (activePane === 'dependencies' && selectedRepo) {
+        const depToUpdate = shownDeps[selectedDepIdx];
+        if (depToUpdate && depToUpdate.latestVersion && !isUpdatingDep) {
+          performDependencyUpdate(selectedRepo.path, depToUpdate.packageName, depToUpdate.latestVersion);
         }
       }
       return;
@@ -418,7 +458,7 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
           flexDirection="column"
           width="50%"
           borderStyle="round"
-          borderColor={activePane === 'details' ? 'cyan' : 'gray'}
+          borderColor={activePane === 'details' || activePane === 'dependencies' ? 'cyan' : 'gray'}
           paddingX={1}
         >
           {selectedRepo ? (
@@ -485,36 +525,40 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
               )}
 
               <Box flexDirection="column" marginTop={1}>
-                <Text bold>📦 Dependency Status:</Text>
-                {pkgStatuses[selectedRepo.path] && pkgStatuses[selectedRepo.path].length > 0 ? (
-                  pkgStatuses[selectedRepo.path]
-                    .filter(status => status.hasDrift || status.isOutdated)
-                    .slice(0, 3)
-                    .map((status) => {
-                      let driftDetail = '';
-                      if (status.hasDrift && status.driftVersions) {
-                        const otherRepos = Object.entries(status.driftVersions)
-                          .filter(([repo]) => repo !== selectedRepo.name)
-                          .map(([repo, ver]) => `${repo}: ${ver}`)
-                          .join(', ');
-                        driftDetail = ` (drift: ${otherRepos})`;
-                      }
+                <Text bold color={activePane === 'dependencies' ? 'cyan' : 'white'}>
+                  📦 Dependency Status:
+                </Text>
+                {shownDeps.length > 0 ? (
+                  shownDeps.slice(0, 3).map((status, idx) => {
+                    const isSelected = idx === selectedDepIdx;
+                    const isDepFocused = isSelected && activePane === 'dependencies';
+                    
+                    let driftDetail = '';
+                    if (status.hasDrift && status.driftVersions) {
+                      const otherRepos = Object.entries(status.driftVersions)
+                        .filter(([repo]) => repo !== selectedRepo.name)
+                        .map(([repo, ver]) => `${repo}: ${ver}`)
+                        .join(', ');
+                      driftDetail = ` (drift: ${otherRepos})`;
+                    }
 
-                      return (
-                        <Text key={status.packageName} color="yellow" dimColor>
-                          ▲ {status.packageName}: {status.currentVersion}
-                          {status.isOutdated && ` → ${status.latestVersion}`}
-                          {driftDetail}
-                        </Text>
-                      );
-                    })
+                    const prefix = isSelected ? '❯ ' : '  ';
+                    const displayColor = isDepFocused ? 'cyan' : isSelected ? 'white' : 'yellow';
+
+                    return (
+                      <Text key={status.packageName} color={displayColor} bold={isSelected} dimColor={!isSelected && !isDepFocused}>
+                        {prefix}▲ {status.packageName}: {status.currentVersion}
+                        {status.isOutdated && ` → ${status.latestVersion}`}
+                        {driftDetail}
+                      </Text>
+                    );
+                  })
                 ) : (
                   <Text color="green">✓ All packages up-to-date & synchronized</Text>
                 )}
-                {pkgStatuses[selectedRepo.path] && 
-                 pkgStatuses[selectedRepo.path].filter(status => status.hasDrift || status.isOutdated).length > 3 && (
+                {shownDeps.length > 3 && (
                   <Text dimColor>
-                    ... and {pkgStatuses[selectedRepo.path].filter(status => status.hasDrift || status.isOutdated).length - 3} more issues
+                    ... and {shownDeps.length - 3} more issues
                   </Text>
                 )}
               </Box>
@@ -528,6 +572,14 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
       <Box height={2} marginTop={1} flexDirection="column">
         {isPulling && (
           <Text color="cyan">{spinner} Pulling updates for {selectedRepo?.name}...</Text>
+        )}
+        {isUpdatingDep && (
+          <Text color="cyan">{spinner} Updating dependency...</Text>
+        )}
+        {!isUpdatingDep && updateDepStatus && (
+          <Text color={updateDepStatus.success ? 'green' : 'red'}>
+            {updateDepStatus.success ? '✓' : '✖'} {updateDepStatus.message}
+          </Text>
         )}
         {!isPulling && pullStatus && pullStatus.repoPath === selectedRepo?.path && (
           <Text color={pullStatus.success ? 'green' : 'red'}>
@@ -590,7 +642,7 @@ export function AppTUI({ initialWorkspacePath }: TUIProps) {
         <Text>
           <Text color="cyan" bold>Tab</Text><Text dimColor> Switch  </Text>
           <Text color="cyan" bold>▲▼</Text><Text dimColor> Navigate  </Text>
-          <Text color="cyan" bold>Space</Text><Text dimColor> Run  </Text>
+          <Text color="cyan" bold>Space</Text><Text dimColor>{activePane === 'dependencies' ? ' Update' : ' Run'}  </Text>
           <Text color="cyan" bold>P</Text><Text dimColor> Pull  </Text>
           <Text color="cyan" bold>A</Text><Text dimColor> Pull All  </Text>
           <Text color="cyan" bold>R</Text><Text dimColor> Refresh  </Text>
